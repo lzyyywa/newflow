@@ -1,14 +1,12 @@
 from torch.nn.modules.loss import CrossEntropyLoss
-
-# Code for "ActionCLIP: ActionCLIP: A New Paradigm for Action Recognition"
-# arXiv:
-# Mengmeng Wang, Jiazheng Xing, Yong Liu
-
 import torch.nn.functional as F
 import torch.nn as nn
 import torch
 import numpy as np
 
+# Code for "ActionCLIP: ActionCLIP: A New Paradigm for Action Recognition"
+# arXiv:
+# Mengmeng Wang, Jiazheng Xing, Yong Liu
 
 def loss_calu(predict, target, config):
     loss_fn = CrossEntropyLoss()
@@ -17,6 +15,7 @@ def loss_calu(predict, target, config):
     batch_obj = batch_obj.cuda()
     batch_target = batch_target.cuda()
     logits, logits_att, logits_obj, logits_soft_prompt = predict
+    
     loss_logit_df = loss_fn(logits, batch_target)
     loss_logit_sp = loss_fn(logits_soft_prompt, batch_target)
     loss_att = loss_fn(logits_att, batch_attr)
@@ -29,24 +28,20 @@ class KLLoss(nn.Module):
     """Loss that uses a 'hinge' on the lower bound.
     This means that for samples with a label value smaller than the threshold, the loss is zero if the prediction is
     also smaller than that threshold.
-    args:
-        error_matric:  What base loss to use (MSE by default).
-        threshold:  Threshold to use for the hinge.
-        clip:  Clip the loss if it is above this value.
     """
 
-    def __init__(self, error_metric=nn.KLDivLoss(size_average=True, reduce=True)):
+    def __init__(self, error_metric=nn.KLDivLoss(reduction='mean')):
         super().__init__()
         print('=========using KL Loss=and has temperature and * bz==========')
         self.error_metric = error_metric
 
-    def forward(self, prediction, label,mul=False):
+    def forward(self, prediction, label, mul=False):
         batch_size = prediction.shape[0]
         probs1 = F.log_softmax(prediction, 1)
         probs2 = F.softmax(label, 1)
         loss = self.error_metric(probs1, probs2)
         if mul:
-            return loss* batch_size
+            return loss * batch_size
         else:
             return loss
 
@@ -65,6 +60,7 @@ def hsic_loss(input1, input2, unbiased=False):
     N = len(input1)
     if N < 4:
         return torch.tensor(0.0).to(input1.device)
+        
     # we simply use the squared dimension of feature as the sigma for RBF kernel
     sigma_x = np.sqrt(input1.size()[1])
     sigma_y = np.sqrt(input2.size()[1])
@@ -77,10 +73,8 @@ def hsic_loss(input1, input2, unbiased=False):
         """Unbiased estimator of Hilbert-Schmidt Independence Criterion
         Song, Le, et al. "Feature selection via dependence maximization." 2012.
         """
-        # tK = kernel_XX - torch.diag(torch.diag(kernel_XX))
-        # tL = kernel_YY - torch.diag(torch.diag(kernel_YY))
-        tK = kernel_XX - torch.diag(kernel_XX)
-        tL = kernel_YY - torch.diag(kernel_YY)
+        tK = kernel_XX - torch.diag(torch.diag(kernel_XX))
+        tL = kernel_YY - torch.diag(torch.diag(kernel_YY))
         hsic = (
                 torch.trace(tK @ tL)
                 + (torch.sum(tK) * torch.sum(tL) / (N - 1) / (N - 2))
@@ -102,19 +96,17 @@ class Gml_loss(nn.Module):
     Loss from No One Left Behind: Improving the Worst Categories in Long-Tailed Learning
     """
 
-    def __init__(self, error_metric=nn.KLDivLoss(size_average=True, reduce=True)):
+    def __init__(self, error_metric=nn.KLDivLoss(reduction='mean')):
         super().__init__()
 
     def forward(self, p_o_on_v, v_label, n_c, t=100.0):
         '''
-
         Args:
-            p_o_on_v: b,n_v,n_o
-            o_label: b,
-            n_c: b,n_o
-
+            p_o_on_v: b, n_v, n_o
+            v_label: b,
+            n_c: b, n_o
         Returns:
-
+            loss value
         '''
         n_c = n_c[:, 0]
         b = p_o_on_v.shape[0]
@@ -125,7 +117,7 @@ class Gml_loss(nn.Module):
 
         p_o_exp = torch.exp(p_o * t)
         p_o_exp_wed = num_c * p_o_exp  # b,n_o
-        p_phi = p_o_exp_wed / torch.sum(p_o_exp_wed, dim=0, keepdim=True)  # b,n_o
+        p_phi = p_o_exp_wed / (torch.sum(p_o_exp_wed, dim=0, keepdim=True) + 1.0e-6)  # b,n_o
 
         p_ba = torch.sum(p_phi * n_c, dim=0, keepdim=True) / (num_c + 1.0e-6)  # 1,n_o
         p_ba[torch.where(p_ba < 1.0e-8)] = 1.0
