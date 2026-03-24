@@ -225,6 +225,9 @@ class CustomCLIP(nn.Module):
             # Since C2C vanilla lacks a direct composition prompt learner, we fuse verb & object text 
             # to synthesize the target composition text embedding (x_1^c) needed by FlowComposer targets.
             self.action_text_fusion = nn.Linear(cfg.emb_dim * 2, cfg.emb_dim, bias=True)
+            
+            # 将 512 维的全局视觉特征投射到 300 维的组合嵌入空间
+            self.c2c_visual_c = nn.Linear(cfg.feat_dim, cfg.emb_dim, bias=True)
 
 
     def forward(self, video, pairs=None, verb_labels=None, obj_labels=None):
@@ -292,7 +295,8 @@ class CustomCLIP(nn.Module):
             # Define endpoints (Visual space x_0)
             x0_v = v_feat
             x0_o = o_feat
-            x0_c = video_features.mean(dim=-1)
+            # 引入刚刚在__init__中定义的线性层，将 512维 变成 300维
+            x0_c = self.c2c_visual_c(video_features.mean(dim=-1))
 
             if self.training:
                 if verb_labels is None or obj_labels is None:
