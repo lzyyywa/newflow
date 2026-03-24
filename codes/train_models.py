@@ -149,7 +149,7 @@ def c2c_vanilla(model, optimizer, lr_scheduler, config, train_dataset, val_datas
                 if use_flow:
                     outputs = model(batch_img, pairs=train_pairs, verb_labels=batch_verb, obj_labels=batch_obj)
                     
-                    # 1. Endpoint Classification Losses (加入极其重要的 cosine_scale 以解决梯度消失)
+                    # 1. Endpoint Classification Losses (保证乘以 cosine_scale 防止梯度消失)
                     loss_verb = Loss_fn(outputs['logits_v'] * config.cosine_scale, batch_verb)
                     loss_obj = Loss_fn(outputs['logits_o'] * config.cosine_scale, batch_obj)
                     loss_com = Loss_fn(outputs['logits_c'] * config.cosine_scale, batch_target)
@@ -161,12 +161,23 @@ def c2c_vanilla(model, optimizer, lr_scheduler, config, train_dataset, val_datas
                                     F.mse_loss(outputs["pred_v_o_leak"], outputs["true_v_o_leak"])
                     loss_mse_total = loss_mse_base + loss_mse_leak
                     
-                    # 3. Explicit Composer Optimization (加入 float() 防御 AMP 崩溃)
+                    # 3. Explicit Composer Optimization (加入防爆的岭回归 Ridge Regression)
                     with torch.no_grad():
                         A = torch.stack([outputs["norm_v_v"], outputs["norm_v_o"]], dim=-1).float() # [B, D, 2]
                         B_target = outputs["true_v_c"].unsqueeze(-1).float() # [B, D, 1]
                         
-                        coeffs_star = torch.linalg.lstsq(A, B_target).solution.squeeze(-1) # [B, 2]
+                        # 构建 A^T A 和 A^T B
+                        A_t = A.transpose(-2, -1) # [B, 2, D]
+                        ATA = torch.bmm(A_t, A)   # [B, 2, 2]
+                        ATB = torch.bmm(A_t, B_target) # [B, 2, 1]
+                        
+                        # 核心防爆机制：加入 L2 正则化项 (lambda * I)，根治奇异矩阵与共线性问题！
+                        lambda_ridge = 0.1 
+                        I = torch.eye(2, device=A.device, dtype=A.dtype).unsqueeze(0)
+                        ATA_ridge = ATA + lambda_ridge * I
+                        
+                        # 安全求解 (A^T A + \lambda I) X = A^T B
+                        coeffs_star = torch.linalg.solve(ATA_ridge, ATB).squeeze(-1) # [B, 2]
                         
                         a_star = coeffs_star[:, 0:1].to(outputs["pred_a"].dtype)
                         b_star = coeffs_star[:, 1:2].to(outputs["pred_b"].dtype)
@@ -182,7 +193,7 @@ def c2c_vanilla(model, optimizer, lr_scheduler, config, train_dataset, val_datas
                     comp_loss_val = loss_comp.item()
 
                 # ==========================================
-                # = 原生 Vanilla 逻辑 (如果不开启 use_flow) =
+                # = 原生 Vanilla 逻辑 =
                 # ==========================================
                 else:
                     p_v, p_o, p_pair_v, p_pair_o, vid_feat, v_feat, o_feat, p_v_con_o, p_o_con_v = model(batch_img)
