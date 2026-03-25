@@ -3,24 +3,13 @@ import torch.nn as nn
 
 from clip import clip
 from clip.simple_tokenizer import SimpleTokenizer as _Tokenizer
-
 from models.vlm_models.text_learner import get_text_learner
-
 import torch.nn.functional as F
-
 from einops import rearrange
 
 _tokenizer = _Tokenizer()
 
-# =====================================================================
-# === FlowComposer Modules (100% Aligned with FlowComposer Paper) ===
-# =====================================================================
-
 class FlowMLP(nn.Module):
-    '''
-    Time-conditioned Primitive Flow Model to predict velocity v_t.
-    Input: [x_t, t]
-    '''
     def __init__(self, feature_dim):
         super(FlowMLP, self).__init__()
         self.net = nn.Sequential(
@@ -35,27 +24,19 @@ class FlowMLP(nn.Module):
         return self.net(x_t)
 
 class FlowComposer(nn.Module):
-    '''
-    Learnable Composer mapping primitive velocities to combination coefficients (a, b).
-    '''
     def __init__(self, feature_dim):
         super(FlowComposer, self).__init__()
         self.net = nn.Sequential(
             nn.Linear(feature_dim * 2, feature_dim),
             nn.LayerNorm(feature_dim),
             nn.GELU(),
-            nn.Linear(feature_dim, 2) # Outputs coefficients a and b
+            nn.Linear(feature_dim, 2)
         )
 
     def forward(self, v_v, v_o):
         x = torch.cat([v_v, v_o], dim=-1)
         coeffs = self.net(x)
         return coeffs[:, 0:1], coeffs[:, 1:2]
-
-
-# =====================================================================
-# === Original MLP & CLIP Components ===
-# =====================================================================
 
 class MLP(nn.Module):
     def __init__(self, inp_dim, out_dim, num_layers=1, relu=True, bias=True, dropout=False, norm=False, layers=[]):
@@ -219,25 +200,19 @@ class CustomCLIP(nn.Module):
         if not self.use_flow:
             o_feat_normed = F.normalize(o_feat, dim=1)
             v_feat_normed = F.normalize(v_feat, dim=1)
-
-            verb_text_features_norm = verb_text_features / verb_text_features.norm(dim=-1, keepdim=True)
-            obj_text_features_norm = obj_text_features / obj_text_features.norm(dim=-1, keepdim=True)
-
+            verb_text_features_norm = F.normalize(verb_text_features, dim=-1)
+            obj_text_features_norm = F.normalize(obj_text_features, dim=-1)
             verb_logits = v_feat_normed @ verb_text_features_norm.t()
             obj_logits = o_feat_normed @ obj_text_features_norm.t()
-
             verb_logits = verb_logits * 0.5 + 0.5
             obj_logits = obj_logits * 0.5 + 0.5
-
             b = video_features.shape[0]
             c = verb_text_features.shape[-1]
             n_v = verb_logits.shape[-1]
             n_o = obj_logits.shape[-1]
-
             o_feat_c = self.c2c_OE2(video_features.mean(dim=-1))
             v_feat_c = self.c2c_VE2(video_features)
             v_feat_c = v_feat_c.mean(dim=-1)
-
             p_v_con_o, p_o_con_v = self.condition_module(v_feat_c, o_feat_c, verb_text_features, obj_text_features, n_o, b, c, n_v)
             p_pair_o = p_v_con_o * obj_logits.unsqueeze(1)  
             p_pair_v = p_o_con_v * verb_logits.unsqueeze(-1)  
@@ -249,56 +224,63 @@ class CustomCLIP(nn.Module):
                 com_logits = p_pair_o[:, verb_idx, obj_idx] + p_pair_v[:, verb_idx, obj_idx]
                 return com_logits
 
+        # =========================================================
+        # === FlowComposer Plugin Branch (The True Marriage!) ===
+        # =========================================================
         else:
             B, D = v_feat.shape
             device = video.device
 
-            x0_v = v_feat
-            x0_o = o_feat
+            x0_v = F.normalize(v_feat, dim=-1)
+            x0_o = F.normalize(o_feat, dim=-1)
             
             o_feat_c = self.c2c_OE2(video_features.mean(dim=-1))
             v_feat_c = self.c2c_VE2(video_features).mean(dim=-1)
-            x0_c = v_feat_c + o_feat_c
+            x0_c = F.normalize(v_feat_c + o_feat_c, dim=-1)
+            
+            verb_text_features_norm = F.normalize(verb_text_features, dim=-1)
+            obj_text_features_norm = F.normalize(obj_text_features, dim=-1)
 
             if self.training:
                 if verb_labels is None or obj_labels is None:
-                    raise ValueError("Flow training requires `verb_labels` and `obj_labels` in the forward pass.")
+                    raise ValueError("Flow training requires `verb_labels` and `obj_labels`.")
 
-                target_x1_v = verb_text_features[verb_labels]
-                target_x1_o = obj_text_features[obj_labels]
-                target_x1_c = target_x1_v + target_x1_o
+                target_x1_v = verb_text_features_norm[verb_labels]
+                target_x1_o = obj_text_features_norm[obj_labels]
 
+                # --- 轨迹约束：计算流的 MSE Loss ---
                 t = torch.rand(B, 1, device=device)
                 xt_v = (1 - t) * x0_v + t * target_x1_v
                 xt_o = (1 - t) * x0_o + t * target_x1_o
 
-                pred_v_v = self.v_flow(xt_v, t)
-                pred_v_o = self.o_flow(xt_o, t)
-
-                pred_x1_v = xt_v + (1 - t) * pred_v_v
-                pred_x1_o = xt_o + (1 - t) * pred_v_o
+                pred_v_v_t = self.v_flow(xt_v, t)
+                pred_v_o_t = self.o_flow(xt_o, t)
 
                 xt_v_leak = (1 - t) * x0_o + t * target_x1_v  
                 xt_o_leak = (1 - t) * x0_v + t * target_x1_o  
                 
-                pred_v_v_leak = self.v_flow(xt_v_leak, t)
-                pred_v_o_leak = self.o_flow(xt_o_leak, t)
-                
-                pred_x1_v_leak = xt_v_leak + (1 - t) * pred_v_v_leak
-                pred_x1_o_leak = xt_o_leak + (1 - t) * pred_v_o_leak
+                pred_v_v_leak_t = self.v_flow(xt_v_leak, t)
+                pred_v_o_leak_t = self.o_flow(xt_o_leak, t)
 
-                norm_v_v = F.normalize(pred_v_v, dim=-1)
-                norm_v_o = F.normalize(pred_v_o, dim=-1)
-                pred_a, pred_b = self.composer(norm_v_v, norm_v_o)
-
-                pred_v_c = pred_a * norm_v_v + pred_b * norm_v_o
-                # 【神坑修复2】彻底抛弃 0.1 步长，训练必须使用 1.0 全步长到达端点算分类！
-                pred_x1_c = x0_c + 1.0 * pred_v_c
+                # --- 零样本分类：1.0 步长直达终点 ---
+                t_zero = torch.zeros(B, 1, device=device)
                 
-                pred_x1_v_norm = F.normalize(pred_x1_v, dim=-1)
-                pred_x1_o_norm = F.normalize(pred_x1_o, dim=-1)
-                verb_text_features_norm = F.normalize(verb_text_features, dim=-1)
-                obj_text_features_norm = F.normalize(obj_text_features, dim=-1)
+                pred_v_v_0 = self.v_flow(x0_v, t_zero)
+                pred_v_o_0 = self.o_flow(x0_o, t_zero)
+                
+                pred_x1_v_0 = x0_v + 1.0 * pred_v_v_0
+                pred_x1_o_0 = x0_o + 1.0 * pred_v_o_0
+                
+                norm_v_v_0 = F.normalize(pred_v_v_0, dim=-1)
+                norm_v_o_0 = F.normalize(pred_v_o_0, dim=-1)
+                pred_a, pred_b = self.composer(norm_v_v_0, norm_v_o_0)
+                
+                pred_v_c_0 = pred_a * norm_v_v_0 + pred_b * norm_v_o_0
+                pred_x1_c_0 = x0_c + 1.0 * pred_v_c_0
+                
+                # 【核心修复】：将 Flow 算出来的精准终点，重新喂回 C2C 去算 Logits
+                pred_x1_v_norm = F.normalize(pred_x1_v_0, dim=-1)
+                pred_x1_o_norm = F.normalize(pred_x1_o_0, dim=-1)
                 
                 logits_v = pred_x1_v_norm @ verb_text_features_norm.t()
                 logits_o = pred_x1_o_norm @ obj_text_features_norm.t()
@@ -306,31 +288,44 @@ class CustomCLIP(nn.Module):
                 logits_v = logits_v * 0.5 + 0.5
                 logits_o = logits_o * 0.5 + 0.5
                 
+                # 【核心修复】：重新激活 C2C 的灵魂！让 Condition Module 继续发挥作用！
+                c = verb_text_features.shape[-1]
+                n_v = logits_v.shape[-1]
+                n_o = logits_o.shape[-1]
+
+                p_v_con_o, p_o_con_v = self.condition_module(v_feat_c, o_feat_c, verb_text_features, obj_text_features, n_o, B, c, n_v)
+                p_pair_o = p_v_con_o * logits_o.unsqueeze(1)
+                p_pair_v = p_o_con_v * logits_v.unsqueeze(-1)
+                
                 logits_c = None
                 if pairs is not None:
                     train_v_inds, train_o_inds = pairs[:, 0], pairs[:, 1]
-                    pair_verb_text = verb_text_features[train_v_inds]
-                    pair_obj_text = obj_text_features[train_o_inds]
                     
-                    train_pair_text_features = pair_verb_text + pair_obj_text
+                    # 1. 拿回 C2C 最擅长的条件概率图 Logits
+                    c2c_graph_logits = p_pair_o[:, train_v_inds, train_o_inds] + p_pair_v[:, train_v_inds, train_o_inds]
+
+                    # 2. 保留 FlowComposer 的显式直接 Logits
+                    pair_verb_text = verb_text_features_norm[train_v_inds]
+                    pair_obj_text = obj_text_features_norm[train_o_inds]
+                    train_pair_text_features = F.normalize(pair_verb_text + pair_obj_text, dim=-1)
                     
-                    pred_x1_c_norm = F.normalize(pred_x1_c, dim=-1)
-                    train_pair_text_features_norm = F.normalize(train_pair_text_features, dim=-1)
+                    pred_x1_c_norm = F.normalize(pred_x1_c_0, dim=-1)
+                    flow_explicit_logits = pred_x1_c_norm @ train_pair_text_features.t()
+                    flow_explicit_logits = flow_explicit_logits * 0.5 + 0.5
                     
-                    logits_c = pred_x1_c_norm @ train_pair_text_features_norm.t()
-                    logits_c = logits_c * 0.5 + 0.5
+                    # 3. 强强联合！图推理兜底 + Flow对齐突破上限
+                    logits_c = c2c_graph_logits + 0.5 * flow_explicit_logits
 
                 return {
                     "logits_v": logits_v, "logits_o": logits_o, "logits_c": logits_c,
-                    "pred_x1_v": pred_x1_v, "pred_x1_o": pred_x1_o, "pred_x1_c": pred_x1_c,
-                    "pred_x1_v_leak": pred_x1_v_leak, "pred_x1_o_leak": pred_x1_o_leak,
-                    "pred_v_v": pred_v_v, "pred_v_o": pred_v_o,
-                    "true_v_v": target_x1_v - x0_v, "true_v_o": target_x1_o - x0_o,
-                    "pred_v_v_leak": pred_v_v_leak, "pred_v_o_leak": pred_v_o_leak,
-                    "true_v_v_leak": target_x1_v - x0_o, "true_v_o_leak": target_x1_o - x0_v,
+                    "pred_v_v": pred_v_v_t, "pred_v_o": pred_v_o_t,
+                    "true_v_v": target_x1_v - x0_v, "true_v_o": F.normalize(target_x1_o, dim=-1) - x0_o,
+                    "pred_v_v_leak": pred_v_v_leak_t, "pred_v_o_leak": pred_v_o_leak_t,
+                    "true_v_v_leak": target_x1_v - x0_o, "true_v_o_leak": F.normalize(target_x1_o, dim=-1) - x0_v,
                     "pred_a": pred_a, "pred_b": pred_b,
-                    "norm_v_v": norm_v_v, "norm_v_o": norm_v_o, "true_v_c": target_x1_c - x0_c,
-                    "verb_text_features": verb_text_features, "obj_text_features": obj_text_features, "logit_scale": self.logit_scale
+                    "norm_v_v": norm_v_v_0, "norm_v_o": norm_v_o_0, 
+                    "true_v_c": F.normalize(target_x1_v + target_x1_o, dim=-1) - x0_c,
+                    "logit_scale": self.logit_scale
                 }
 
             else:
@@ -339,26 +334,46 @@ class CustomCLIP(nn.Module):
                 pred_v_v = self.v_flow(x0_v, t_zero)
                 pred_v_o = self.o_flow(x0_o, t_zero)
                 
+                pred_x1_v_0 = x0_v + 1.0 * pred_v_v
+                pred_x1_o_0 = x0_o + 1.0 * pred_v_o
+                
                 norm_v_v = F.normalize(pred_v_v, dim=-1)
                 norm_v_o = F.normalize(pred_v_o, dim=-1)
                 pred_a, pred_b = self.composer(norm_v_v, norm_v_o)
                 
                 pred_v_c = pred_a * norm_v_v + pred_b * norm_v_o
+                pred_x1_c_0 = x0_c + 1.0 * pred_v_c
                 
-                # 【神坑修复2】因为代码里不写 ODE 积分 Loop (For 循环)，这里也必须是 1.0 直接推过去
-                pred_x1_c = x0_c + 1.0 * pred_v_c
+                # 【推理阶段】：同样双端验证，C2C 过滤 + Flow 打分
+                pred_x1_v_norm = F.normalize(pred_x1_v_0, dim=-1)
+                pred_x1_o_norm = F.normalize(pred_x1_o_0, dim=-1)
+                
+                logits_v = pred_x1_v_norm @ verb_text_features_norm.t()
+                logits_o = pred_x1_o_norm @ obj_text_features_norm.t()
+                logits_v = logits_v * 0.5 + 0.5
+                logits_o = logits_o * 0.5 + 0.5
+                
+                c = verb_text_features.shape[-1]
+                n_v = logits_v.shape[-1]
+                n_o = logits_o.shape[-1]
+
+                p_v_con_o, p_o_con_v = self.condition_module(v_feat_c, o_feat_c, verb_text_features, obj_text_features, n_o, B, c, n_v)
+                p_pair_o = p_v_con_o * logits_o.unsqueeze(1)
+                p_pair_v = p_o_con_v * logits_v.unsqueeze(-1)
                 
                 verb_idx, obj_idx = pairs[:, 0], pairs[:, 1]
-                pair_verb_text = verb_text_features[verb_idx]
-                pair_obj_text = obj_text_features[obj_idx]
                 
-                pair_text_features = pair_verb_text + pair_obj_text
+                c2c_graph_logits = p_pair_o[:, verb_idx, obj_idx] + p_pair_v[:, verb_idx, obj_idx]
                 
-                pred_x1_c_norm = F.normalize(pred_x1_c, dim=-1)
-                pair_text_features_norm = F.normalize(pair_text_features, dim=-1)
+                pair_verb_text = verb_text_features_norm[verb_idx]
+                pair_obj_text = obj_text_features_norm[obj_idx]
+                pair_text_features = F.normalize(pair_verb_text + pair_obj_text, dim=-1)
                 
-                com_logits = pred_x1_c_norm @ pair_text_features_norm.t()
-                com_logits = com_logits * 0.5 + 0.5
+                pred_x1_c_norm = F.normalize(pred_x1_c_0, dim=-1)
+                flow_explicit_logits = pred_x1_c_norm @ pair_text_features.t()
+                flow_explicit_logits = flow_explicit_logits * 0.5 + 0.5
+                
+                com_logits = c2c_graph_logits + 0.5 * flow_explicit_logits
                 
                 return com_logits
 
@@ -385,13 +400,11 @@ def load_clip_to_cpu(cfg):
     backbone_name = cfg.backbone
     url = clip._MODELS[backbone_name]
     model_path = clip._download(url)
-
     try:
         model = torch.jit.load(model_path, map_location="cpu").eval()
         state_dict = None
     except RuntimeError:
         state_dict = torch.load(model_path, map_location="cpu")
-
     model = clip.build_model(state_dict or model.state_dict())
     return model
 
@@ -399,10 +412,8 @@ def build_model(train_dataset,cfg):
     print(f"Loading CLIP (backbone: {cfg.backbone})")
     clip_model = load_clip_to_cpu(cfg)
     clip_model.float()
-
     print("Building custom CLIP")
     model = CustomCLIP(cfg, train_dataset, clip_model)
-
     print("Turning off gradients in both the image and the text encoder")
     for name, param in model.named_parameters():
         param.requires_grad_(False)
@@ -411,22 +422,15 @@ def build_model(train_dataset,cfg):
                 if cfg.learn_input_method == 'coop':
                     if 'prompt_vectors' in name:
                         param.requires_grad_(True)
-                        print(f'{name}: {param.requires_grad}')
                 elif cfg.learn_input_method == 'csp':
                     if 'obj_embedding' in name or 'verb_embedding' in name or 'comp_embedding' in name:
                         param.requires_grad_(True)
-                        print(f'{name}: {param.requires_grad}')
                 elif cfg.learn_input_method == 'spm':
                     if 'prompt_vectors' in name or 'obj_embedding' in name or 'verb_embedding' in name or 'comp_embedding' in name:
                         param.requires_grad_(True)
-                        print(f'{name}: {param.requires_grad}')
-                else:
-                    raise NotImplementedError
         elif 'video_encoder' in name:
             if 'temporal_embedding' in name or 'ln_post' in name or 'Adapter' in name or 'clip_proj' in name:
                 param.requires_grad = True
-                print(f'{name}: {param.requires_grad}')
         elif 'c2c' in name or 'flow' in name or 'composer' in name:
             param.requires_grad = True
-            print(f'{name}: {param.requires_grad}')
     return model
