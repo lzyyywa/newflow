@@ -1,6 +1,5 @@
 import torch
 import torch.nn as nn
-
 from clip import clip
 from clip.simple_tokenizer import SimpleTokenizer as _Tokenizer
 from models.vlm_models.text_learner import get_text_learner
@@ -18,7 +17,6 @@ class FlowMLP(nn.Module):
             nn.GELU(),
             nn.Linear(feature_dim * 2, feature_dim)
         )
-
     def forward(self, x, t):
         x_t = torch.cat([x, t], dim=-1)
         return self.net(x_t)
@@ -32,9 +30,8 @@ class FlowComposer(nn.Module):
             nn.GELU(),
             nn.Linear(feature_dim, 2)
         )
-
-    def forward(self, v_v, v_o):
-        x = torch.cat([v_v, v_o], dim=-1)
+    def forward(self, delta_v, delta_o):
+        x = torch.cat([delta_v, delta_o], dim=-1)
         coeffs = self.net(x)
         return coeffs[:, 0:1], coeffs[:, 1:2]
 
@@ -44,25 +41,16 @@ class MLP(nn.Module):
         mod = []
         incoming = inp_dim
         for layer_ind in range(num_layers - 1):
-            if len(layers) == 0:
-                outgoing = incoming
-            else:
-                outgoing = layers[layer_ind]
+            if len(layers) == 0: outgoing = incoming
+            else: outgoing = layers[layer_ind]
             mod.append(nn.Linear(incoming, outgoing, bias=bias))
-
             incoming = outgoing
-            if norm:
-                mod.append(nn.LayerNorm(outgoing))
+            if norm: mod.append(nn.LayerNorm(outgoing))
             mod.append(nn.ReLU(inplace=True))
-            if dropout:
-                mod.append(nn.Dropout(p=0.5))
-
+            if dropout: mod.append(nn.Dropout(p=0.5))
         mod.append(nn.Linear(incoming, out_dim, bias=bias))
-
-        if relu:
-            mod.append(nn.ReLU(inplace=True))
+        if relu: mod.append(nn.ReLU(inplace=True))
         self.mod = nn.Sequential(*mod)
-
     def forward(self, x):
         return self.mod(x)
 
@@ -72,33 +60,23 @@ class MLP_ST(nn.Module):
         mod = []
         incoming = inp_dim
         for layer_ind in range(num_layers - 1):
-            if len(layers) == 0:
-                outgoing = incoming
-            else:
-                outgoing = layers[layer_ind]
+            if len(layers) == 0: outgoing = incoming
+            else: outgoing = layers[layer_ind]
             mod.append(nn.Conv1d(incoming, outgoing, kernel_size=3, bias=bias, padding=1))
-
             incoming = outgoing
-            if norm:
-                mod.append(nn.LayerNorm(outgoing))
+            if norm: mod.append(nn.LayerNorm(outgoing))
             mod.append(nn.ReLU(inplace=True))
-            if dropout:
-                mod.append(nn.Dropout(p=0.5))
-
+            if dropout: mod.append(nn.Dropout(p=0.5))
         mod.append(nn.Conv1d(incoming, out_dim, kernel_size=3, bias=bias, padding=1))
-
-        if relu:
-            mod.append(nn.ReLU(inplace=True))
+        if relu: mod.append(nn.ReLU(inplace=True))
         self.mod = nn.Sequential(*mod)
-
     def forward(self, x):
         for o in self.mod:
             if isinstance(o, nn.LayerNorm):
                 x = x.transpose(1, 2)
                 x = o(x)
                 x = x.transpose(1, 2)
-            else:
-                x = o(x)
+            else: x = o(x)
         return x
 
 class TextEncoder(nn.Module):
@@ -110,13 +88,11 @@ class TextEncoder(nn.Module):
         for block in self.transformer.resblocks:
             block.attn_mask = block.attn_mask[:cfg.ctx_length, :cfg.ctx_length]
         self.dtype = clip_model.dtype
-
     def forward(self, x, tokenized_prompts):
         x = x.permute(1, 0, 2)
         x = self.transformer(x)
         x = x.permute(1, 0, 2)
         x = self.ln_final(x)
-
         x = x[torch.arange(x.shape[0]), tokenized_prompts.argmax(dim=-1)] @ self.text_projection
         return x
 
@@ -126,8 +102,7 @@ class VideoEncoder(nn.Module):
         from models.vlm_models.AIM import get_aim
         self.visual = get_aim(cfg)
         self.clip_proj = clip_model.visual.proj
-        self.num_frames=cfg.num_frames
-
+        self.num_frames = cfg.num_frames
     def forward(self, x):
         out = self.visual(x)
         if self.clip_proj is not None:
@@ -147,34 +122,25 @@ class CustomCLIP(nn.Module):
         self.video_encoder = VideoEncoder(cfg, clip_model)
         self.logit_scale = clip_model.logit_scale
 
-        try:
-            fc_emb = cfg.fc_emb.split(',')
-        except:
-            fc_emb = [cfg.fc_emb]
-        layers = []
-        for a in fc_emb:
-            a = int(a)
-            layers.append(a)
+        try: fc_emb = cfg.fc_emb.split(',')
+        except: fc_emb = [cfg.fc_emb]
+        layers = [int(a) for a in fc_emb]
 
-        self.c2c_OE1 = MLP(cfg.feat_dim, int(cfg.emb_dim), relu=cfg.relu, num_layers=cfg.nlayers,
-                           dropout=False, norm=True, layers=layers)
-        self.c2c_OE2 = MLP(cfg.feat_dim, int(cfg.emb_dim), relu=cfg.relu, num_layers=cfg.nlayers,
-                           dropout=False, norm=True, layers=layers)
-        self.c2c_VE1 = MLP_ST(cfg.feat_dim, int(cfg.emb_dim), relu=cfg.relu, num_layers=cfg.nlayers,
-                              dropout=False, norm=True, layers=layers)
-        self.c2c_VE2 = MLP_ST(cfg.feat_dim, int(cfg.emb_dim), relu=cfg.relu, num_layers=cfg.nlayers,
-                              dropout=False, norm=True, layers=layers)
+        self.c2c_OE1 = MLP(cfg.feat_dim, int(cfg.emb_dim), relu=cfg.relu, num_layers=cfg.nlayers, norm=True, layers=layers)
+        self.c2c_OE2 = MLP(cfg.feat_dim, int(cfg.emb_dim), relu=cfg.relu, num_layers=cfg.nlayers, norm=True, layers=layers)
+        self.c2c_VE1 = MLP_ST(cfg.feat_dim, int(cfg.emb_dim), relu=cfg.relu, num_layers=cfg.nlayers, norm=True, layers=layers)
+        self.c2c_VE2 = MLP_ST(cfg.feat_dim, int(cfg.emb_dim), relu=cfg.relu, num_layers=cfg.nlayers, norm=True, layers=layers)
 
         self.c2c_text_v = nn.Linear(cfg.feat_dim, cfg.emb_dim, bias=True)
         self.c2c_text_o = nn.Linear(cfg.feat_dim, cfg.emb_dim, bias=True)
-
         self.c2c_f_v_e_o_com = nn.Linear(2 * cfg.emb_dim, cfg.emb_dim, bias=True)
         self.c2c_f_o_e_v_com = nn.Linear(2 * cfg.emb_dim, cfg.emb_dim, bias=True)
 
         self.use_flow = getattr(cfg, 'use_flow', False)
         if self.use_flow:
-            self.flow_v_proj = nn.Linear(cfg.emb_dim + cfg.feat_dim, cfg.feat_dim)
-            self.flow_o_proj = nn.Linear(cfg.emb_dim + cfg.feat_dim, cfg.feat_dim)
+            # 最纯净版的投影，只用原本的 300 维特征
+            self.flow_v_proj = nn.Linear(cfg.emb_dim, cfg.feat_dim)
+            self.flow_o_proj = nn.Linear(cfg.emb_dim, cfg.feat_dim)
             self.flow_c_proj = nn.Linear(cfg.feat_dim, cfg.feat_dim)
             
             self.v_flow = FlowMLP(cfg.feat_dim)
@@ -184,7 +150,6 @@ class CustomCLIP(nn.Module):
     def forward(self, video, pairs=None, verb_labels=None, obj_labels=None):
         verb_prompts = self.verb_prompt_learner()
         raw_verb_text_features = self.text_encoder(verb_prompts, self.verb_tokenized_prompts) 
-        
         obj_prompts = self.obj_prompt_learner()
         raw_obj_text_features = self.text_encoder(obj_prompts, self.obj_tokenized_prompts) 
 
@@ -205,22 +170,18 @@ class CustomCLIP(nn.Module):
             obj_text_features_norm = F.normalize(obj_text_features, dim=-1)
             verb_logits = v_feat_normed @ verb_text_features_norm.t() * 0.5 + 0.5
             obj_logits = o_feat_normed @ obj_text_features_norm.t() * 0.5 + 0.5
-            b = video_features.shape[0]
-            c = verb_text_features.shape[-1]
-            n_v = verb_logits.shape[-1]
-            n_o = obj_logits.shape[-1]
+            b, c = video_features.shape[0], verb_text_features.shape[-1]
+            n_v, n_o = verb_logits.shape[-1], obj_logits.shape[-1]
             o_feat_c = self.c2c_OE2(vid_feat)
             v_feat_c = self.c2c_VE2(video_features).mean(dim=-1)
             p_v_con_o, p_o_con_v = self.condition_module(v_feat_c, o_feat_c, verb_text_features, obj_text_features, n_o, b, c, n_v)
             p_pair_o = p_v_con_o * obj_logits.unsqueeze(1)
             p_pair_v = p_o_con_v * verb_logits.unsqueeze(-1)
-
             if self.training:
                 return verb_logits, obj_logits, p_pair_v, p_pair_o, video_features, o_feat, v_feat, p_v_con_o, p_o_con_v
             else:
                 verb_idx, obj_idx = pairs[:, 0], pairs[:, 1]
-                com_logits = p_pair_o[:, verb_idx, obj_idx] + p_pair_v[:, verb_idx, obj_idx]
-                return com_logits
+                return p_pair_o[:, verb_idx, obj_idx] + p_pair_v[:, verb_idx, obj_idx]
 
         else:
             B = v_feat.shape[0]
@@ -241,45 +202,48 @@ class CustomCLIP(nn.Module):
             p_pair_v = p_o_con_v * logits_v_base.unsqueeze(-1)
 
             if self.training:
+                # 隔离保护
                 v_feat_d = v_feat.detach()
                 o_feat_d = o_feat.detach()
                 vid_feat_d = vid_feat.detach()
-                
-                # 获取纯净且归一化后的文本基元，这是构建统一相加空间的基础
                 raw_v_text_d = raw_verb_text_features.detach()
                 raw_o_text_d = raw_obj_text_features.detach()
-                e_v = F.normalize(raw_v_text_d, dim=-1)
-                e_o = F.normalize(raw_o_text_d, dim=-1)
 
-                v_cat_d = torch.cat([v_feat_d, vid_feat_d], dim=-1)
-                o_cat_d = torch.cat([o_feat_d, vid_feat_d], dim=-1)
-
-                x0_v_flow = F.normalize(self.flow_v_proj(v_cat_d), dim=-1)
-                x0_o_flow = F.normalize(self.flow_o_proj(o_cat_d), dim=-1)
+                # 纯特征直接投影，不做拼接
+                x0_v_flow = F.normalize(self.flow_v_proj(v_feat_d), dim=-1)
+                x0_o_flow = F.normalize(self.flow_o_proj(o_feat_d), dim=-1)
                 x0_c_flow = F.normalize(self.flow_c_proj(vid_feat_d), dim=-1)
 
+                e_v = F.normalize(raw_v_text_d, dim=-1)
+                e_o = F.normalize(raw_o_text_d, dim=-1)
                 target_x1_v = e_v[verb_labels]
                 target_x1_o = e_o[obj_labels]
 
                 t = torch.rand(B, 1, device=device)
                 xt_v = (1 - t) * x0_v_flow + t * target_x1_v
                 xt_o = (1 - t) * x0_o_flow + t * target_x1_o
-
+                
                 pred_v_v_t = self.v_flow(xt_v, t)
                 pred_v_o_t = self.o_flow(xt_o, t)
+
+                # 正统推演落脚点
+                pred_x1_v = xt_v + (1 - t) * pred_v_v_t
+                pred_x1_o = xt_o + (1 - t) * pred_v_o_t
+
+                # Composer 计算
+                delta_v_t = F.normalize(pred_v_v_t, dim=-1)
+                delta_o_t = F.normalize(pred_v_o_t, dim=-1)
+                pred_a, pred_b = self.composer(delta_v_t, delta_o_t)
 
                 t_zero = torch.zeros(B, 1, device=device)
                 pred_v_v_0 = self.v_flow(x0_v_flow, t_zero)
                 pred_v_o_0 = self.o_flow(x0_o_flow, t_zero)
-
-                norm_v_v_in = F.normalize(pred_v_v_0, dim=-1)
-                norm_v_o_in = F.normalize(pred_v_o_0, dim=-1)
-                pred_a, pred_b = self.composer(norm_v_v_in, norm_v_o_in)
-
-                pred_v_c_0 = pred_a * pred_v_v_0 + pred_b * pred_v_o_0
                 
-                pred_x1_v = x0_v_flow + pred_v_v_0
-                pred_x1_o = x0_o_flow + pred_v_o_0
+                delta_v_0 = F.normalize(pred_v_v_0, dim=-1)
+                delta_o_0 = F.normalize(pred_v_o_0, dim=-1)
+                a_0, b_0 = self.composer(delta_v_0, delta_o_0)
+                
+                pred_v_c_0 = a_0 * delta_v_0 + b_0 * delta_o_0
                 pred_x1_c_0 = x0_c_flow + 1.0 * pred_v_c_0
 
                 logits_c = None
@@ -291,49 +255,35 @@ class CustomCLIP(nn.Module):
                     train_v_inds, train_o_inds = pairs[:, 0], pairs[:, 1]
                     logits_c = p_pair_o[:, train_v_inds, train_o_inds] + p_pair_v[:, train_v_inds, train_o_inds]
 
-                    logits_v_flow = F.normalize(pred_x1_v, dim=-1) @ e_v.t() * 0.5 + 0.5
-                    logits_o_flow = F.normalize(pred_x1_o, dim=-1) @ e_o.t() * 0.5 + 0.5
+                    # 纯净的 Cosine 打分
+                    logits_v_flow = F.normalize(pred_x1_v, dim=-1) @ e_v.t()
+                    logits_o_flow = F.normalize(pred_x1_o, dim=-1) @ e_o.t()
 
-                    # 【极微小瑕疵修复】这里统一使用归一化后的特征(e_v, e_o)相加，保证训练和推理标尺绝对一致！
                     train_pair_text_features_raw = e_v[train_v_inds] + e_o[train_o_inds]
-                    logits_c_flow = F.normalize(pred_x1_c_0, dim=-1) @ F.normalize(train_pair_text_features_raw, dim=-1).t() * 0.5 + 0.5
+                    logits_c_flow = F.normalize(pred_x1_c_0, dim=-1) @ F.normalize(train_pair_text_features_raw, dim=-1).t()
 
                 target_x1_c = None
                 if verb_labels is not None and obj_labels is not None:
-                    # 同样，这里也是用 e_v + e_o，为 train_models.py 的 MSE 提供绝对精准的物理目标！
                     target_x1_c = e_v[verb_labels] + e_o[obj_labels]
 
                 return {
-                    "logits_v": logits_v_base,
-                    "logits_o": logits_o_base,
-                    "logits_c": logits_c,
-                    "logits_v_flow": logits_v_flow,
-                    "logits_o_flow": logits_o_flow,
-                    "logits_c_flow": logits_c_flow,
-
+                    "logits_v": logits_v_base, "logits_o": logits_o_base, "logits_c": logits_c,
+                    "logits_v_flow": logits_v_flow, "logits_o_flow": logits_o_flow, "logits_c_flow": logits_c_flow,
                     "pred_v_v": pred_v_v_t, "pred_v_o": pred_v_o_t,
-                    "true_v_v": target_x1_v - x0_v_flow, 
-                    "true_v_o": target_x1_o - x0_o_flow,
-                    
+                    "true_v_v": target_x1_v - x0_v_flow, "true_v_o": target_x1_o - x0_o_flow,
                     "pred_a": pred_a, "pred_b": pred_b,
-                    "raw_v_v_0": pred_v_v_0, "raw_v_o_0": pred_v_o_0,
-                    
-                    "true_v_c": F.normalize(target_x1_v + target_x1_o, dim=-1) - x0_c_flow, 
-                    "pred_x1_c_0": pred_x1_c_0,
-                    "target_x1_c": target_x1_c,
-                    
+                    "raw_v_v_t": pred_v_v_t, "raw_v_o_t": pred_v_o_t,
+                    "true_v_c": target_x1_c - x0_c_flow, 
+                    "pred_x1_c_0": pred_x1_c_0, "target_x1_c": target_x1_c,
                     "logit_scale": self.logit_scale
                 }
 
             else:
-                # ====== 测试推断阶段 ======
                 t_zero = torch.zeros(B, 1, device=device)
 
-                v_cat = torch.cat([v_feat, vid_feat], dim=-1)
-                o_cat = torch.cat([o_feat, vid_feat], dim=-1)
-
-                x0_v_flow = F.normalize(self.flow_v_proj(v_cat), dim=-1)
-                x0_o_flow = F.normalize(self.flow_o_proj(o_cat), dim=-1)
+                # 测试时也只用纯特征投影
+                x0_v_flow = F.normalize(self.flow_v_proj(v_feat), dim=-1)
+                x0_o_flow = F.normalize(self.flow_o_proj(o_feat), dim=-1)
                 x0_c_flow = F.normalize(self.flow_c_proj(vid_feat), dim=-1)
 
                 raw_verb_text_norm = F.normalize(raw_verb_text_features, dim=-1)
@@ -342,42 +292,31 @@ class CustomCLIP(nn.Module):
                 pred_v_v = self.v_flow(x0_v_flow, t_zero)
                 pred_v_o = self.o_flow(x0_o_flow, t_zero)
 
-                norm_v_v_in = F.normalize(pred_v_v, dim=-1)
-                norm_v_o_in = F.normalize(pred_v_o, dim=-1)
-                pred_a, pred_b = self.composer(norm_v_v_in, norm_v_o_in)
+                delta_v_0 = F.normalize(pred_v_v, dim=-1)
+                delta_o_0 = F.normalize(pred_v_o, dim=-1)
+                pred_a, pred_b = self.composer(delta_v_0, delta_o_0)
 
-                pred_v_c = pred_a * pred_v_v + pred_b * pred_v_o
+                pred_v_c = pred_a * delta_v_0 + pred_b * delta_o_0
                 pred_x1_c_0 = x0_c_flow + 1.0 * pred_v_c
 
                 verb_idx, obj_idx = pairs[:, 0], pairs[:, 1]
-                
                 c2c_graph_logits = p_pair_o[:, verb_idx, obj_idx] + p_pair_v[:, verb_idx, obj_idx]
 
-                # 测试时用的也是归一化后特征的相加，和训练完全对齐了！
                 pair_verb_text_raw = raw_verb_text_norm[verb_idx]
                 pair_obj_text_raw = raw_obj_text_norm[obj_idx]
                 pair_text_features_raw = pair_verb_text_raw + pair_obj_text_raw
 
                 flow_explicit_logits = F.normalize(pred_x1_c_0, dim=-1) @ F.normalize(pair_text_features_raw, dim=-1).t() * 0.5 + 0.5
-
                 com_logits = c2c_graph_logits + 0.5 * flow_explicit_logits
-
                 return com_logits
 
     def condition_module(self, v_feat_c, o_feat_c, v_emb, o_emb, n_o, b, c, n_v):
         v_emb_normed = F.normalize(v_emb, dim=1)
         o_emb_normed = F.normalize(o_emb, dim=1)
-
-        f_v_e_o = self.c2c_f_v_e_o_com(
-            torch.cat([v_feat_c.unsqueeze(1).repeat(1, n_o, 1), o_emb.unsqueeze(0).repeat(b, 1, 1)], dim=-1).view(-1, c * 2))
-        f_v_e_o_norm = F.normalize(f_v_e_o, dim=-1)
-        f_v_e_o_norm = f_v_e_o_norm.view(b, n_o, c)
-
-        f_o_e_v = self.c2c_f_o_e_v_com(
-            torch.cat([o_feat_c.unsqueeze(1).repeat(1, n_v, 1), v_emb.unsqueeze(0).repeat(b, 1, 1)], dim=-1).view(-1, c * 2))
-        f_o_e_v_norm = F.normalize(f_o_e_v, dim=-1)
-        f_o_e_v_norm = f_o_e_v_norm.view(b, n_v, c)
-
+        f_v_e_o = self.c2c_f_v_e_o_com(torch.cat([v_feat_c.unsqueeze(1).repeat(1, n_o, 1), o_emb.unsqueeze(0).repeat(b, 1, 1)], dim=-1).view(-1, c * 2))
+        f_v_e_o_norm = F.normalize(f_v_e_o, dim=-1).view(b, n_o, c)
+        f_o_e_v = self.c2c_f_o_e_v_com(torch.cat([o_feat_c.unsqueeze(1).repeat(1, n_v, 1), v_emb.unsqueeze(0).repeat(b, 1, 1)], dim=-1).view(-1, c * 2))
+        f_o_e_v_norm = F.normalize(f_o_e_v, dim=-1).view(b, n_v, c)
         p_v_con_o = torch.einsum('bnc,mc->bnm', f_v_e_o_norm, v_emb_normed) * 0.5 + 0.5
         p_v_con_o = p_v_con_o.permute(0, 2, 1)
         p_o_con_v = torch.einsum('bnc,mc->bnm', f_o_e_v_norm, o_emb_normed) * 0.5 + 0.5
@@ -406,18 +345,12 @@ def build_model(train_dataset,cfg):
         param.requires_grad_(False)
         if "prompt_learner" in name:
             if cfg.learn_input_method != 'zero':
-                if cfg.learn_input_method == 'coop':
-                    if 'prompt_vectors' in name:
-                        param.requires_grad_(True)
-                elif cfg.learn_input_method == 'csp':
-                    if 'obj_embedding' in name or 'verb_embedding' in name or 'comp_embedding' in name:
-                        param.requires_grad_(True)
-                elif cfg.learn_input_method == 'spm':
-                    if 'prompt_vectors' in name or 'obj_embedding' in name or 'verb_embedding' in name or 'comp_embedding' in name:
+                if cfg.learn_input_method in ['coop', 'csp', 'spm']:
+                    if any(key in name for key in ['prompt_vectors', 'obj_embedding', 'verb_embedding', 'comp_embedding']):
                         param.requires_grad_(True)
         elif 'video_encoder' in name:
-            if 'temporal_embedding' in name or 'ln_post' in name or 'Adapter' in name or 'clip_proj' in name:
+            if any(key in name for key in ['temporal_embedding', 'ln_post', 'Adapter', 'clip_proj']):
                 param.requires_grad = True
-        elif 'c2c' in name or 'flow' in name or 'composer' in name:
+        elif any(key in name for key in ['c2c', 'flow', 'composer']):
             param.requires_grad = True
     return model
