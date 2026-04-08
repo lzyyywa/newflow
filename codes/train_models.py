@@ -33,7 +33,6 @@ def cal_conditional(attr2idx, obj2idx, set_name, daset):
     return v_o_on_v, v_o_on_o
 
 def evaluate(model, dataset, config):
-    """验证集/测试集评估函数"""
     model.eval()
     evaluator = test.Evaluator(dataset, model=None)
     all_logits, all_attr_gt, all_obj_gt, all_pair_gt, loss_avg = test.predict_logits(model, dataset, config)
@@ -75,11 +74,10 @@ def c2c_vanilla(model, optimizer, lr_scheduler, config, train_dataset, val_datas
         epoch_com_losses = []
         epoch_verb_losses = []
         epoch_obj_losses = []
-
         epoch_mse_losses = []
-        epoch_comp_losses = []
-        epoch_flow_ce_losses = []
-        epoch_endpoint_mse_losses = []
+        epoch_mse_v_losses = []
+        epoch_mse_o_losses = []
+        epoch_mse_c_losses = []
 
         use_flow = getattr(config, 'use_flow', False)
         temp_lr = optimizer.param_groups[-1]['lr']
@@ -93,56 +91,33 @@ def c2c_vanilla(model, optimizer, lr_scheduler, config, train_dataset, val_datas
 
             with torch.cuda.amp.autocast(enabled=True):
                 if use_flow:
+                    # 🔥 极致纯净还原：由于单卡安全，原封不动地传入 pairs=train_pairs！
+                    # 模型内部会完美算出 logits_c，保证你原汁原味的 C2C Baseline 逻辑。
                     outputs = model(batch_img, pairs=train_pairs, verb_labels=batch_verb, obj_labels=batch_obj)
 
+                    # 1. 基础分类 Loss (你的原生 C2C 逻辑)
                     loss_verb = Loss_fn(outputs['logits_v'] * config.cosine_scale, batch_verb)
                     loss_obj = Loss_fn(outputs['logits_o'] * config.cosine_scale, batch_obj)
                     loss_com = Loss_fn(outputs['logits_c'] * config.cosine_scale, batch_target)
 
-                    loss_v_flow = Loss_fn(outputs['logits_v_flow'] * config.cosine_scale, batch_verb)
-                    loss_o_flow = Loss_fn(outputs['logits_o_flow'] * config.cosine_scale, batch_obj)
-                    loss_c_flow = Loss_fn(outputs['logits_c_flow'] * config.cosine_scale, batch_target)
-                    total_flow_ce = loss_v_flow + loss_o_flow + loss_c_flow
-
+                    # 2. 🔥 我们的核心 Idea：端到端轨迹流匹配 Loss
                     loss_mse_v = F.mse_loss(outputs["pred_v_v_seq"], outputs["true_v_v_seq"])
-                    loss_mse_o = F.mse_loss(outputs["pred_v_o"], outputs["true_v_o"])
-                    loss_mse_total = loss_mse_v + loss_mse_o
+                    loss_mse_o = F.mse_loss(outputs["pred_v_o_seq"], outputs["true_v_o_seq"])
+                    loss_mse_c = F.mse_loss(outputs["pred_v_c_seq"], outputs["true_v_c_seq"])
+                    
+                    loss_mse_total = loss_mse_v + loss_mse_o + loss_mse_c
+                    flow_weight = getattr(config, 'flow_loss_weight', 10.0) 
 
-                    with torch.no_grad():
-                        delta_v_0 = F.normalize(outputs["raw_v_v_0"], dim=-1)
-                        delta_o_0 = F.normalize(outputs["raw_v_o_0"], dim=-1)
-                        A = torch.stack([delta_v_0, delta_o_0], dim=-1).float()
-                        B_target = outputs["true_v_c"].unsqueeze(-1).float()
-                        A_t = A.transpose(-2, -1)
-                        ATA = torch.bmm(A_t, A).float()
-                        ATB = torch.bmm(A_t, B_target).float()
-                        lambda_ridge = 0.1
-                        I = torch.eye(2, device=A.device, dtype=torch.float32).unsqueeze(0)
-                        ATA_ridge = ATA + lambda_ridge * I
-                        coeffs_star = torch.linalg.solve(ATA_ridge, ATB).squeeze(-1)
-                        a_star = coeffs_star[:, 0:1].to(outputs["pred_a"].dtype)
-                        b_star = coeffs_star[:, 1:2].to(outputs["pred_b"].dtype)
-
-                    loss_comp = F.mse_loss(outputs["pred_a"], a_star) + F.mse_loss(outputs["pred_b"], b_star)
-
-                    pred_x1_norm = F.normalize(outputs["pred_x1_c_0"], dim=-1)
-                    target_x1_norm = F.normalize(outputs["target_x1_c"], dim=-1)
-                    loss_endpoint_mse = F.mse_loss(pred_x1_norm, target_x1_norm)
-
-                    flow_weight = getattr(config, 'flow_loss_weight', 1.0)
-                    comp_weight = getattr(config, 'composer_weight', 1.0)
-                    flow_ce_weight = getattr(config, 'flow_ce_weight', 0.5)
-
-                    loss = loss_com + 0.2 * (loss_verb + loss_obj) + \
-                           flow_weight * loss_mse_total + comp_weight * loss_comp + \
-                           flow_ce_weight * total_flow_ce + 1.0 * loss_endpoint_mse
+                    # 基础任务 + 流匹配辅助任务 融合
+                    loss = loss_com + 0.2 * (loss_verb + loss_obj) + flow_weight * loss_mse_total
 
                     mse_loss_val = loss_mse_total.item()
-                    comp_loss_val = loss_comp.item()
-                    flow_ce_val = total_flow_ce.item()
-                    endpoint_mse_val = loss_endpoint_mse.item()
+                    mse_v_val = loss_mse_v.item()
+                    mse_o_val = loss_mse_o.item()
+                    mse_c_val = loss_mse_c.item()
 
                 else:
+                    # 传统的 Vanilla C2C 逻辑
                     p_v, p_o, p_pair_v, p_pair_o, _, _, _, _, _ = model(batch_img)
                     loss_verb = Loss_fn(p_v * config.cosine_scale, batch_verb)
                     loss_obj = Loss_fn(p_o * config.cosine_scale, batch_obj)
@@ -150,8 +125,13 @@ def c2c_vanilla(model, optimizer, lr_scheduler, config, train_dataset, val_datas
                     pred_com_train = (p_pair_v + p_pair_o)[:, train_v_inds, train_o_inds]
                     loss_com = Loss_fn(pred_com_train * config.cosine_scale, batch_target)
                     loss = loss_com + 0.2 * (loss_verb + loss_obj)
-                    mse_loss_val, comp_loss_val, flow_ce_val, endpoint_mse_val = 0.0, 0.0, 0.0, 0.0
+                    
+                    mse_loss_val = 0.0
+                    mse_v_val = 0.0
+                    mse_o_val = 0.0
+                    mse_c_val = 0.0
 
+                # 记录每一个分支的 Loss 状态
                 verb_loss_val = loss_verb.item()
                 obj_loss_val = loss_obj.item()
                 loss = loss / config.gradient_accumulation_steps
@@ -164,14 +144,14 @@ def c2c_vanilla(model, optimizer, lr_scheduler, config, train_dataset, val_datas
                 optimizer.zero_grad()
 
             epoch_train_losses.append(loss.item() * config.gradient_accumulation_steps)
-            epoch_com_losses.append(loss_com.item())
+            epoch_com_losses.append(loss_com.item() if isinstance(loss_com, torch.Tensor) else loss_com)
             epoch_verb_losses.append(verb_loss_val)
             epoch_obj_losses.append(obj_loss_val)
             if use_flow:
                 epoch_mse_losses.append(mse_loss_val)
-                epoch_comp_losses.append(comp_loss_val)
-                epoch_flow_ce_losses.append(flow_ce_val)
-                epoch_endpoint_mse_losses.append(endpoint_mse_val)
+                epoch_mse_v_losses.append(mse_v_val)
+                epoch_mse_o_losses.append(mse_o_val)
+                epoch_mse_c_losses.append(mse_c_val)
 
             postfix = {
                 "loss": np.mean(epoch_train_losses[-50:]),
@@ -182,9 +162,9 @@ def c2c_vanilla(model, optimizer, lr_scheduler, config, train_dataset, val_datas
             if use_flow:
                 postfix.update({
                     "l_mse": np.mean(epoch_mse_losses[-50:]),
-                    "l_cmp": np.mean(epoch_comp_losses[-50:]),
-                    "l_f_ce": np.mean(epoch_flow_ce_losses[-50:]),
-                    "l_ep": np.mean(epoch_endpoint_mse_losses[-50:])
+                    "m_v": np.mean(epoch_mse_v_losses[-50:]),
+                    "m_o": np.mean(epoch_mse_o_losses[-50:]),
+                    "m_c": np.mean(epoch_mse_c_losses[-50:])
                 })
             progress_bar.set_postfix(postfix)
             progress_bar.update()
@@ -197,22 +177,16 @@ def c2c_vanilla(model, optimizer, lr_scheduler, config, train_dataset, val_datas
                          f"l_v: {np.mean(epoch_verb_losses):.4f}, "
                          f"l_o: {np.mean(epoch_obj_losses):.4f}")
         if use_flow:
-            epoch_summary += (f", l_mse: {np.mean(epoch_mse_losses):.4f}, "
-                              f"l_cmp: {np.mean(epoch_comp_losses):.4f}, "
-                              f"l_f_ce: {np.mean(epoch_flow_ce_losses):.4f}, "
-                              f"l_ep: {np.mean(epoch_endpoint_mse_losses):.4f}")
+            epoch_summary += (f", l_mse: {np.mean(epoch_mse_losses):.4f} "
+                              f"(v:{np.mean(epoch_mse_v_losses):.4f}, "
+                              f"o:{np.mean(epoch_mse_o_losses):.4f}, "
+                              f"c:{np.mean(epoch_mse_c_losses):.4f})")
+        
         print(epoch_summary)
         log_training.write(epoch_summary + "\n")
 
-        # ==========================================
-        # 评估逻辑 (集成 val_epochs_ts 修复)
-        # ==========================================
         val_start_thresh = getattr(config, 'val_epochs_ts', config.epochs + 1)
 
-        # 满足以下任一条件即评估：
-        # 1. 当前 epoch 已经过了设定的阈值 (如 45)
-        # 2. 满足 eval_every_n 的频率要求
-        # 3. 最后一个 epoch
         if (i + 1 >= val_start_thresh) or (i % config.eval_every_n == 0) or (i + 1 == config.epochs):
             print("Evaluating val dataset:")
             loss_avg, val_result = evaluate(model, val_dataset, config)
@@ -228,7 +202,6 @@ def c2c_vanilla(model, optimizer, lr_scheduler, config, train_dataset, val_datas
                 print(f"New best Val {config.best_model_metric}: {best_metric:.4f}. Running TEST...")
 
                 _, test_result = evaluate(model, test_dataset, config)
-
                 test_log = "TEST -> "
                 for key in test_result:
                     if key in ["attr_acc", "obj_acc", "AUC", "best_hm"]:
@@ -240,17 +213,7 @@ def c2c_vanilla(model, optimizer, lr_scheduler, config, train_dataset, val_datas
 
         log_training.flush()
 
-    # === 训练完全结束后，加载最佳模型进行最终评估 ===
     print("\n--- Training Completed. Final Evaluation on Best Model ---")
     model.load_state_dict(torch.load(os.path.join(config.save_path, "best.pt")))
     _, final_test_result = evaluate(model, test_dataset, config)
-
-    final_str = "FINAL TEST -> "
-    for key in final_test_result:
-        if key in ["attr_acc", "obj_acc", "AUC", "best_hm"]:
-            final_str += f"{key}: {round(final_test_result[key], 4)} | "
-    log_training.write(final_str + "\n")
     log_training.close()
-
-def c2c_enhance(model, optimizer, lr_scheduler, config, train_dataset, val_dataset, test_dataset, scaler):
-    pass
